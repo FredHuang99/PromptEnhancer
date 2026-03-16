@@ -1,4 +1,5 @@
 torch>=2.5.0
+torchvision
 datasets
 accelerate
 numpy

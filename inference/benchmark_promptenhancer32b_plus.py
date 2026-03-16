@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 import math
@@ -12,13 +13,13 @@ from datasets import load_dataset
 from transformers import AutoProcessor
 from transformers.generation.streamers import BaseStreamer
 
-try:
-    from inference.prompt_enhancer_v2 import PromptEnhancerV2
-except ModuleNotFoundError as e:
-    if e.name != "inference":
-        raise
-    # Allow running this file directly from the `inference/` directory.
-    from prompt_enhancer_v2 import PromptEnhancerV2
+# Ensure project root is on PYTHONPATH when running this file directly.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from inference.prompt_enhancer_v2 import PromptEnhancerV2
 from qwen_vl_utils import process_vision_info
 
 
