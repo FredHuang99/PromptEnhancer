@@ -4,7 +4,9 @@ import time
 import json
 import math
 import argparse
+import builtins
 from threading import Thread
+from functools import partial
 from typing import List, Optional
 
 import numpy as np
@@ -20,6 +22,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from inference.prompt_enhancer_v2 import PromptEnhancerV2
+
+# Ensure real-time logs in nohup/non-interactive runs.
+print = partial(builtins.print, flush=True)
 
 
 # 娑撹桨绨￠崪灞肩稑娑撳﹣绔撮悧?benchmark 妞嬪孩鐗告穱婵囧瘮娑撯偓閼疯揪绱濇潻娆撳櫡娣囨繄鏆€娑撯偓娑?sys prompt閵?
