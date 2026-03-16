@@ -12,7 +12,13 @@ from datasets import load_dataset
 from transformers import AutoProcessor
 from transformers.generation.streamers import BaseStreamer
 
-from inference.prompt_enhancer_v2 import PromptEnhancerV2
+try:
+    from inference.prompt_enhancer_v2 import PromptEnhancerV2
+except ModuleNotFoundError as e:
+    if e.name != "inference":
+        raise
+    # Allow running this file directly from the `inference/` directory.
+    from prompt_enhancer_v2 import PromptEnhancerV2
 from qwen_vl_utils import process_vision_info
 
 
