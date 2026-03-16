@@ -167,6 +167,7 @@ def run_once(
     temperature: float = 0.0,
     top_p: float = 0.9,
     top_k: int = 5,
+    use_cache: bool = True,
 ):
     inputs = build_processor_inputs(enhancer.processor, prompt, sys_prompt).to("cuda")
     streamer = TimingStreamer()
@@ -178,6 +179,7 @@ def run_once(
         do_sample=do_sample,
         top_p=top_p,
         top_k=top_k,
+        use_cache=use_cache,
     )
     if do_sample:
         gen_kwargs["temperature"] = temperature
@@ -185,9 +187,21 @@ def run_once(
     sync_all_visible_gpus()
     t0 = time.perf_counter()
 
-    th = Thread(target=enhancer.model.generate, kwargs=gen_kwargs)
+    err_holder = []
+
+    def _generate_with_inference_mode():
+        try:
+            with torch.inference_mode():
+                enhancer.model.generate(**gen_kwargs)
+        except Exception as e:
+            err_holder.append(e)
+
+    th = Thread(target=_generate_with_inference_mode)
     th.start()
     th.join()
+
+    if err_holder:
+        raise err_holder[0]
 
     sync_all_visible_gpus()
     t1 = time.perf_counter()
@@ -269,6 +283,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--use-cache", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable KV cache during generation (default: true)")
 
     args = parser.parse_args()
 
@@ -341,6 +357,7 @@ def main():
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                use_cache=args.use_cache,
             )
 
         results = []
@@ -355,6 +372,7 @@ def main():
                     temperature=args.temperature,
                     top_p=args.top_p,
                     top_k=args.top_k,
+                    use_cache=args.use_cache,
                 )
             except Exception as e:
                 print(f"[WARN] generation failed at idx={i}: {e}")
