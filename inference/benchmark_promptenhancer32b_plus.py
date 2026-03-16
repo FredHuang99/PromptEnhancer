@@ -70,8 +70,12 @@ def normalize_prompt(s: str) -> str:
     return " ".join(str(s).strip().split())
 
 
-def load_en_prompts_from_hf(limit: Optional[int] = None) -> List[str]:
-    ds = load_dataset("PromptEnhancer/T2I-Keypoints-Eval", split="train")
+def load_en_prompts_from_hf(limit: Optional[int] = None,
+                            file_path: str = None) -> List[str]:
+    if file_path:
+        ds = load_dataset(file_path, split="train")
+    else:
+        ds = load_dataset("PromptEnhancer/T2I-Keypoints-Eval", split="train")
     prompts = []
     for item in ds:
         if item.get("language") == "en" and item.get("prompt"):
@@ -231,6 +235,8 @@ def main():
                         help="Use English subset of PromptEnhancer/T2I-Keypoints-Eval")
     parser.add_argument("--prompt-file", type=str, default=None,
                         help="Local txt file, one prompt per line")
+    parser.add_argument("--prompt-dataset", type=str, default=None,
+                        help="Local prompt dataset in HuggingFace format, e.g. ./my_prompts")
     parser.add_argument("--limit", type=int, default=None)
 
     # 模型 / processor
@@ -264,7 +270,7 @@ def main():
 
     # 先拿 prompts
     if args.use_hf_en:
-        prompts = load_en_prompts_from_hf(limit=args.limit)
+        prompts = load_en_prompts_from_hf(limit=args.limit, file_path=args.prompt_dataset)
         print(f"Loaded {len(prompts)} English prompts from HF dataset.")
     else:
         prompts = load_prompts_from_txt(args.prompt_file, limit=args.limit)
