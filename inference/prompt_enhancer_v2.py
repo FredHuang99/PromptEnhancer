@@ -3,87 +3,156 @@ Copyright (c) 2025 Tencent. All Rights Reserved.
 Licensed under the Tencent Hunyuan Community License Agreement.
 """
 
-import re
-import os
-import time
+import importlib.util
 import logging
+import os
+import re
+import time
+from typing import Any, Dict, List
 
 import torch
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    Qwen2_5_VLForConditionalGeneration,
+)
 
-def replace_single_quotes(text):
+DEFAULT_SYS_PROMPT = (
+    "Please think step by step and rewrite the user's prompt for text-to-image generation "
+    "while preserving the original intent."
+)
+
+
+def replace_single_quotes(text: str) -> str:
     """
-    Replace single quotes within words with double quotes, and convert
-    curly single quotes to curly double quotes for consistency.
+    Replace single quotes within words with double quotes.
     """
     pattern = r"\B'([^']*)'\B"
-    replaced_text = re.sub(pattern, r'"\1"', text)
-    replaced_text = replaced_text.replace("’", "”")
-    replaced_text = replaced_text.replace("‘", "“")
-    return replaced_text
+    return re.sub(pattern, r'"\1"', text)
+
 
 class PromptEnhancerV2:
-
-    def __init__(self, models_root_path, device_map="auto"):
+    def __init__(self, models_root_path: str, device_map: str = "auto"):
         """
-        Initialize the PromptEnhancerV2 class with model and processor.
+        Initialize model and processor/tokenizer with automatic backend selection.
 
-        Args:
-            models_root_path (str): Path to the pretrained model.
-            device_map (str): Device mapping for model loading.
+        Supports both:
+        - qwen2_5_vl checkpoints (vision-language)
+        - hunyuan_v1_dense checkpoints (text-only CausalLM)
         """
-        # Lazy logging setup (will be no-op if already configured by app)
         if not logging.getLogger(__name__).handlers:
             logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            models_root_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=device_map,
+        self.models_root_path = models_root_path
+        self.device_map = device_map
+        self.config = AutoConfig.from_pretrained(models_root_path, trust_remote_code=True)
+        self.model_type = str(getattr(self.config, "model_type", ""))
+        self.is_vl = self.model_type == "qwen2_5_vl"
+
+        dtype = self._pick_dtype()
+        attn_impl = self._preferred_attn_impl()
+
+        common_kwargs: Dict[str, Any] = {
+            "torch_dtype": dtype,
+            "device_map": device_map,
+        }
+
+        if self.is_vl:
+            model_cls = Qwen2_5_VLForConditionalGeneration
+            processor_loader = AutoProcessor
+            model_kwargs = dict(common_kwargs)
+            # Qwen2.5-VL does not need trust_remote_code here.
+        else:
+            model_cls = AutoModelForCausalLM
+            processor_loader = AutoTokenizer
+            model_kwargs = dict(common_kwargs)
+            model_kwargs["trust_remote_code"] = True
+
+        self.model, self.attn_implementation = self._load_model_with_fallback(
+            model_cls=model_cls,
+            model_path=models_root_path,
+            base_kwargs=model_kwargs,
+            preferred_attn_impl=attn_impl,
         )
-        self.processor = AutoProcessor.from_pretrained(models_root_path)
 
-    @torch.inference_mode()
-    def predict(
+        # Keep the attribute name `processor` so existing call sites continue to work.
+        self.processor = processor_loader.from_pretrained(
+            models_root_path,
+            trust_remote_code=not self.is_vl,
+        )
+
+        self.logger.info(
+            "Loaded model_type=%s, backend=%s, attn_implementation=%s",
+            self.model_type,
+            "VL" if self.is_vl else "CausalLM",
+            self.attn_implementation,
+        )
+
+    def _pick_dtype(self):
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+
+    def _preferred_attn_impl(self) -> str:
+        # Prefer FA2 only when CUDA + flash_attn are both available.
+        if torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None:
+            return "flash_attention_2"
+        return "sdpa"
+
+    def _load_model_with_fallback(
         self,
-        prompt_cot,
-        sys_prompt="请根据用户的输入，生成思考过程的思维链并改写提示词：",
-        temperature=0,
-        top_p=1.0,
-        max_new_tokens=2048,
-        device="cuda",
+        model_cls,
+        model_path: str,
+        base_kwargs: Dict[str, Any],
+        preferred_attn_impl: str,
     ):
-        """
-        Generate a rewritten prompt using the model.
+        kwargs = dict(base_kwargs)
+        kwargs["attn_implementation"] = preferred_attn_impl
 
-        Args:
-            prompt_cot (str): The original prompt to be rewritten.
-            sys_prompt (str): System prompt to guide the rewriting.
-            temperature (float): Sampling temperature.
-            top_p (float): Top-p sampling parameter.
-            max_new_tokens (int): Maximum number of new tokens to generate.
-            device (str): Device for inference.
-
-        Returns:
-            str: The rewritten prompt, or the original if generation fails.
-        """
-        org_prompt_cot = prompt_cot
         try:
-            user_prompt_format = sys_prompt + "\n" + org_prompt_cot
+            return model_cls.from_pretrained(model_path, **kwargs), preferred_attn_impl
+        except ImportError as e:
+            if preferred_attn_impl == "flash_attention_2" and "flash_attn" in str(e):
+                self.logger.warning(
+                    "flash_attn is unavailable; fallback to sdpa attention. Original error: %s", e
+                )
+                kwargs["attn_implementation"] = "sdpa"
+                return model_cls.from_pretrained(model_path, **kwargs), "sdpa"
+            raise
+        except ValueError as e:
+            # Some backends may reject specific attention names.
+            if "attn_implementation" in str(e):
+                kwargs.pop("attn_implementation", None)
+                return model_cls.from_pretrained(model_path, **kwargs), "default"
+            raise
+        except TypeError:
+            # Some custom models may not accept attn_implementation.
+            kwargs.pop("attn_implementation", None)
+            return model_cls.from_pretrained(model_path, **kwargs), "default"
+
+    def build_inputs(self, user_prompt: str, sys_prompt: str, device: str = "cuda"):
+        """
+        Build generation inputs for both VL and text-only backends.
+        """
+        if self.is_vl:
+            from qwen_vl_utils import process_vision_info
+
+            merged = f"{sys_prompt}\n{user_prompt}" if sys_prompt else user_prompt
             messages = [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt_format},
-                    ],
+                    "content": [{"type": "text", "text": merged}],
                 }
             ]
-
             text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
             image_inputs, video_inputs = process_vision_info(messages)
             inputs = self.processor(
@@ -93,14 +162,53 @@ class PromptEnhancerV2:
                 padding=True,
                 return_tensors="pt",
             )
-            inputs = inputs.to(device)
+        else:
+            messages: List[Dict[str, str]] = []
+            if sys_prompt:
+                messages.append({"role": "system", "content": sys_prompt})
+            messages.append({"role": "user", "content": user_prompt})
+
+            if hasattr(self.processor, "apply_chat_template"):
+                text = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                text = f"{sys_prompt}\n{user_prompt}" if sys_prompt else user_prompt
+
+            inputs = self.processor(
+                [text],
+                padding=True,
+                return_tensors="pt",
+            )
+
+        return inputs.to(device)
+
+    @torch.inference_mode()
+    def predict(
+        self,
+        prompt_cot: str,
+        sys_prompt: str = DEFAULT_SYS_PROMPT,
+        temperature: float = 0,
+        top_p: float = 1.0,
+        max_new_tokens: int = 2048,
+        device: str = "cuda",
+    ) -> str:
+        """
+        Generate a rewritten prompt; fallback to original prompt on failure.
+        """
+        org_prompt_cot = prompt_cot
+        try:
+            inputs = self.build_inputs(prompt_cot, sys_prompt, device=device)
             generated_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=2048,
+                max_new_tokens=max_new_tokens,
                 temperature=float(temperature),
-                do_sample=False,
+                do_sample=bool(temperature > 0),
                 top_k=5,
-                top_p=0.9
+                top_p=float(top_p),
+                use_cache=True,
             )
             generated_ids_trimmed = [
                 out_ids[len(in_ids):]
@@ -112,55 +220,36 @@ class PromptEnhancerV2:
                 clean_up_tokenization_spaces=False,
             )
             output_res = output_text[0]
-            assert output_res.count("think>") == 2
-            prompt_cot = output_res.split("think>")[-1]
+
+            # Keep compatibility with the old output parser.
+            if output_res.count("think>") >= 2:
+                prompt_cot = output_res.split("think>")[-1]
+            else:
+                prompt_cot = output_res
+
             if prompt_cot.startswith("\n"):
                 prompt_cot = prompt_cot[1:]
             prompt_cot = replace_single_quotes(prompt_cot)
         except Exception:
             prompt_cot = org_prompt_cot
-            print("✗ Re-prompting failed, so we are using the original prompt")
+            print("Re-prompting failed, so using the original prompt")
 
         return prompt_cot
 
+
 if __name__ == "__main__":
-    model_path = os.environ.get('MODEL_OUTPUT_PATH', "/path/to/your/qwen-model")
-
-    prompt_enhancer_cls = PromptEnhancerV2(
-        models_root_path=model_path
-    )
-
-    test_list_zh = [
-        "一幅书法作品，上边写着'生于忧患，死于安乐。'",
-        "第三人称视角，赛车在城市赛道上飞驰，左上角是小地图，地图下面是当前名次，右下角仪表盘显示当前速度。",
-        "韩系插画风女生头像，粉紫色短发+透明感腮红，侧光渲染。",
-        "点彩派，盛夏海滨，两位渔夫正在搬运木箱，三艘帆船停在岸边，对角线构图。",
-        "一幅由梵高绘制的梦境麦田，旋转的蓝色星云与燃烧的向日葵相纠缠。",
-    ]
+    model_path = os.environ.get("MODEL_OUTPUT_PATH", "/path/to/your/model")
+    prompt_enhancer_cls = PromptEnhancerV2(models_root_path=model_path)
 
     test_list_en = [
         "Create a painting depicting a 30-year-old white female white-collar worker on a business trip by plane.",
         "Depicted in the anime style of Studio Ghibli, a girl stands quietly at the deck with a gentle smile.",
         "Blue background, a lone girl gazes into the distant sea; her expression is sorrowful.",
-        "A blend of expressionist and vintage styles, drawing a building with colorful walls.",
-        "Paint a winter scene with crystalline ice hangings from an Antarctic research station.",
     ]
 
-    print("Testing Chinese prompts:")
-    for item in test_list_zh:
-        print("User Prompt:", item)
-        print("---------:")
-        time_start = time.time()
-        result = prompt_enhancer_cls.predict(item)
-        time_end = time.time()
-        print("RePrompt:", result)
-        print("Time cost:", time_end - time_start)
-        print("~~~~~~~~~~~~~~")
-
-    print("\nTesting English prompts:")
+    print("Testing prompts:")
     for item in test_list_en:
         print("User Prompt:", item)
-        print("---------:")
         time_start = time.time()
         result = prompt_enhancer_cls.predict(item)
         time_end = time.time()

@@ -10,7 +10,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import AutoProcessor
+from transformers import AutoTokenizer
 from transformers.generation.streamers import BaseStreamer
 
 # Ensure project root is on PYTHONPATH when running this file directly.
@@ -20,7 +20,6 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from inference.prompt_enhancer_v2 import PromptEnhancerV2
-from qwen_vl_utils import process_vision_info
 
 
 # 为了和你上一版 benchmark 风格保持一致，这里保留一个 sys prompt。
@@ -112,49 +111,8 @@ def save_numeric_lines(values: List[float], out_path: str):
             f.write(f"{x}\n")
 
 
-def build_messages(user_prompt: str, sys_prompt: str):
-    if sys_prompt:
-        merged = sys_prompt + "\n" + user_prompt
-    else:
-        merged = user_prompt
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": merged},
-            ],
-        }
-    ]
-    return messages
-
-
-def build_processor_inputs(processor, user_prompt: str, sys_prompt: str):
-    messages = build_messages(user_prompt, sys_prompt)
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    return inputs
-
-
-'''
-def get_input_token_length(processor, user_prompt: str, sys_prompt: str) -> int:
-    inputs = build_processor_inputs(processor, user_prompt, sys_prompt)
-    return int(inputs["input_ids"].shape[1])
-'''
-
-def get_input_token_length(processor, user_prompt: str, sys_prompt: str) -> int:
-    ids = processor.tokenizer(user_prompt, return_tensors="pt")["input_ids"]
+def get_input_token_length(tokenizer, user_prompt: str, sys_prompt: str) -> int:
+    ids = tokenizer(user_prompt, return_tensors="pt")["input_ids"]
     return int(ids.shape[1])
 
 
@@ -169,7 +127,7 @@ def run_once(
     top_k: int = 5,
     use_cache: bool = True,
 ):
-    inputs = build_processor_inputs(enhancer.processor, prompt, sys_prompt).to("cuda")
+    inputs = enhancer.build_inputs(prompt, sys_prompt, device="cuda")
     streamer = TimingStreamer()
 
     gen_kwargs = dict(
@@ -316,12 +274,12 @@ def main():
 
     # 功能 2：统计英文数据输入长度
     if need_processor:
-        print("Loading processor only...")
-        processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+        print("Loading tokenizer only...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         input_lens = []
         for i, p in enumerate(prompts):
             try:
-                n = get_input_token_length(processor, p, args.sys_prompt)
+                n = get_input_token_length(tokenizer, p, args.sys_prompt)
             except Exception as e:
                 print(f"[WARN] input length failed at idx={i}: {e}")
                 n = -1
