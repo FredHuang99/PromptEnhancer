@@ -51,6 +51,7 @@ class PromptEnhancerV2:
         self.config = AutoConfig.from_pretrained(models_root_path, trust_remote_code=True)
         self.model_type = str(getattr(self.config, "model_type", ""))
         self.is_vl = self.model_type == "qwen2_5_vl"
+        self.is_hunyuan_dense = self.model_type == "hunyuan_v1_dense"
 
         dtype = self._pick_dtype()
         attn_impl = self._preferred_attn_impl()
@@ -62,14 +63,17 @@ class PromptEnhancerV2:
 
         if self.is_vl:
             model_cls = Qwen2_5_VLForConditionalGeneration
-            processor_loader = AutoProcessor
             model_kwargs = dict(common_kwargs)
             # Qwen2.5-VL does not need trust_remote_code here.
-        else:
+        elif self.is_hunyuan_dense:
             model_cls = AutoModelForCausalLM
-            processor_loader = AutoTokenizer
             model_kwargs = dict(common_kwargs)
             model_kwargs["trust_remote_code"] = True
+        else:
+            raise ValueError(
+                f"Unsupported model_type: {self.model_type}. "
+                "Expected one of: qwen2_5_vl, hunyuan_v1_dense."
+            )
 
         self.model, self.attn_implementation = self._load_model_with_fallback(
             model_cls=model_cls,
@@ -79,15 +83,17 @@ class PromptEnhancerV2:
         )
 
         # Keep the attribute name `processor` so existing call sites continue to work.
-        self.processor = processor_loader.from_pretrained(
-            models_root_path,
-            trust_remote_code=not self.is_vl,
-        )
+        if self.is_vl:
+            self.processor = AutoProcessor.from_pretrained(models_root_path)
+        else:
+            self.processor = AutoTokenizer.from_pretrained(
+                models_root_path, trust_remote_code=True
+            )
 
         self.logger.info(
             "Loaded model_type=%s, backend=%s, attn_implementation=%s",
             self.model_type,
-            "VL" if self.is_vl else "CausalLM",
+            "Qwen2.5-VL" if self.is_vl else "HunyuanDense CausalLM",
             self.attn_implementation,
         )
 
