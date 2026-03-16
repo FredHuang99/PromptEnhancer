@@ -6,3 +6,4 @@ numpy
 transformers>=4.56.0
 huggingface-hub
 qwen-vl-utils
+tiktoken

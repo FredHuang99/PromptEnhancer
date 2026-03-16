@@ -57,7 +57,7 @@ class PromptEnhancerV2:
         attn_impl = self._preferred_attn_impl()
 
         common_kwargs: Dict[str, Any] = {
-            "torch_dtype": dtype,
+            "dtype": dtype,
             "device_map": device_map,
         }
 
@@ -86,9 +86,17 @@ class PromptEnhancerV2:
         if self.is_vl:
             self.processor = AutoProcessor.from_pretrained(models_root_path)
         else:
-            self.processor = AutoTokenizer.from_pretrained(
-                models_root_path, trust_remote_code=True
-            )
+            try:
+                self.processor = AutoTokenizer.from_pretrained(
+                    models_root_path, trust_remote_code=True
+                )
+            except ImportError as e:
+                if "tiktoken" in str(e).lower():
+                    raise ImportError(
+                        "Loading hunyuan_v1_dense tokenizer requires `tiktoken`. "
+                        "Please run: pip install tiktoken"
+                    ) from e
+                raise
 
         self.logger.info(
             "Loaded model_type=%s, backend=%s, attn_implementation=%s",
