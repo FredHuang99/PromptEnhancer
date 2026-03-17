@@ -216,8 +216,8 @@ def run_once(
 
     ttft = streamer.token_times[0] - t0
     if num_out_tokens >= 2:
-        inter = np.diff(streamer.token_times)
-        tpot = float(np.mean(inter))
+        decode_end = streamer.end_time if streamer.end_time is not None else t1
+        tpot = (decode_end - streamer.token_times[0]) / float(num_out_tokens - 1)
     else:
         tpot = float("nan")
 
@@ -363,15 +363,6 @@ def main():
     if need_model:
         do_sample = args.temperature > 0.0
 
-        print("Loading PromptEnhancerV2 model...")
-        enhancer = PromptEnhancerV2(
-            models_root_path=args.model,
-            device_map="auto",
-        )
-
-        if hasattr(enhancer.model, "hf_device_map"):
-            print("hf_device_map =", enhancer.model.hf_device_map)
-
         # Resume is based on existing line counts in output txt files.
         resume_count = 0
         resume_counts = []
@@ -397,8 +388,53 @@ def main():
             print(f"[RESUME] Skip first {resume_count} prompts in selected range.")
         if resume_count >= len(prompts):
             print("[RESUME] Selected range is already fully processed.")
+            if args.benchmark_e2e_txt is not None:
+                e2e_vals = load_numeric_lines(args.benchmark_e2e_txt)
+                print("[Summary][e2e_ms]", json.dumps(summarize_numeric(e2e_vals), indent=2, ensure_ascii=False))
+            if args.export_output_lens_txt is not None:
+                out_lens = load_numeric_lines(args.export_output_lens_txt)
+                print("[Summary][output_tokens]", json.dumps(summarize_numeric(out_lens), indent=2, ensure_ascii=False))
+            if args.benchmark_json is not None:
+                payload = {
+                    "args": vars(args),
+                    "selected_range": {
+                        "start_idx": start_idx,
+                        "end_idx": end_idx,
+                        "final_count": len(prompts),
+                        "resume_count": resume_count,
+                    },
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                    "summary": {
+                        "e2e_ms": summarize_numeric(load_numeric_lines(args.benchmark_e2e_txt)) if args.benchmark_e2e_txt else {},
+                        "output_tokens": summarize_numeric(load_numeric_lines(args.export_output_lens_txt)) if args.export_output_lens_txt else {},
+                    },
+                    "results": [],
+                }
+                with open(args.benchmark_json, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                print(f"[OK] Saved benchmark json to: {args.benchmark_json}")
+            return
 
         remaining_prompts = prompts[resume_count:]
+
+        print("Loading PromptEnhancerV2 model...")
+        enhancer = PromptEnhancerV2(
+            models_root_path=args.model,
+            device_map="auto",
+        )
+
+        if hasattr(enhancer.model, "hf_device_map"):
+            print("hf_device_map =", enhancer.model.hf_device_map)
+
+        if hasattr(enhancer.model, "config"):
+            enhancer.model.config.use_cache = bool(args.use_cache)
+        if hasattr(enhancer.model, "generation_config"):
+            enhancer.model.generation_config.use_cache = bool(args.use_cache)
+        print(
+            f"[CACHE] requested={bool(args.use_cache)} "
+            f"model.config.use_cache={getattr(getattr(enhancer.model, 'config', None), 'use_cache', None)} "
+            f"generation_config.use_cache={getattr(getattr(enhancer.model, 'generation_config', None), 'use_cache', None)}"
+        )
 
         warmup_n = min(args.warmup, len(remaining_prompts))
         print(f"Warmup x {warmup_n}")
