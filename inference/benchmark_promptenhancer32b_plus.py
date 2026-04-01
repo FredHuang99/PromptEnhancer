@@ -184,12 +184,6 @@ def verify_kv_cache_runtime(
     use_cache: bool,
 ):
     inputs = enhancer.build_inputs(prompt, sys_prompt, device="cuda")
-    probe_kwargs = dict(
-        **inputs,
-        max_new_tokens=max(2, min(4, max_new_tokens)),
-        do_sample=False,
-        use_cache=use_cache,
-    )
 
     trace = []
     original_forward = enhancer.model.forward
@@ -206,7 +200,12 @@ def verify_kv_cache_runtime(
     enhancer.model.forward = MethodType(traced_forward, enhancer.model)
     try:
         with torch.inference_mode():
-            enhancer.model.generate(**probe_kwargs)
+            enhancer.generate_with_compat(
+                inputs,
+                max_new_tokens=max(2, min(4, max_new_tokens)),
+                do_sample=False,
+                use_cache=use_cache,
+            )
     finally:
         enhancer.model.forward = original_forward
 
@@ -265,7 +264,6 @@ def run_once(
     streamer = TimingStreamer()
 
     gen_kwargs = dict(
-        **inputs,
         streamer=streamer,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
@@ -284,7 +282,7 @@ def run_once(
     def _generate_with_inference_mode():
         try:
             with torch.inference_mode():
-                enhancer.model.generate(**gen_kwargs)
+                enhancer.generate_with_compat(inputs, **gen_kwargs)
         except Exception as e:
             err_holder.append(e)
 

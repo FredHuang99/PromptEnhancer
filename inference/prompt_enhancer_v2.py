@@ -3,6 +3,7 @@ Copyright (c) 2025 Tencent. All Rights Reserved.
 Licensed under the Tencent Hunyuan Community License Agreement.
 """
 
+import ast
 import importlib.util
 import logging
 import os
@@ -104,6 +105,38 @@ class PromptEnhancerV2:
             "Qwen2.5-VL" if self.is_vl else "HunyuanDense CausalLM",
             self.attn_implementation,
         )
+
+    @staticmethod
+    def _extract_unused_model_kwargs(exc: Exception) -> List[str]:
+        msg = str(exc)
+        marker = "The following `model_kwargs` are not used by the model:"
+        if marker not in msg:
+            return []
+        try:
+            tail = msg.split(marker, 1)[1].strip()
+            keys_part = tail.split("(note:", 1)[0].strip()
+            parsed = ast.literal_eval(keys_part)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        except Exception:
+            return []
+        return []
+
+    def generate_with_compat(self, inputs: Dict[str, Any], **generate_kwargs):
+        try:
+            return self.model.generate(**inputs, **generate_kwargs)
+        except ValueError as e:
+            unused_keys = self._extract_unused_model_kwargs(e)
+            retryable_keys = [k for k in unused_keys if k in inputs]
+            if not retryable_keys:
+                raise
+
+            filtered_inputs = {k: v for k, v in inputs.items() if k not in retryable_keys}
+            self.logger.warning(
+                "Dropping unsupported generate input keys for current transformers version: %s",
+                retryable_keys,
+            )
+            return self.model.generate(**filtered_inputs, **generate_kwargs)
 
     def _pick_dtype(self):
         if torch.cuda.is_available():
@@ -215,8 +248,8 @@ class PromptEnhancerV2:
         org_prompt_cot = prompt_cot
         try:
             inputs = self.build_inputs(prompt_cot, sys_prompt, device=device)
-            generated_ids = self.model.generate(
-                **inputs,
+            generated_ids = self.generate_with_compat(
+                inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=float(temperature),
                 do_sample=bool(temperature > 0),
