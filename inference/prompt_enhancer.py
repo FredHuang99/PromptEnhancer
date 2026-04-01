@@ -41,6 +41,9 @@ class HunyuanPromptEnhancer:
         self.model = AutoModelForCausalLM.from_pretrained(
             models_root_path, device_map=device_map, trust_remote_code=True
         )
+        self.model.config.use_cache = True
+        if hasattr(self.model, "generation_config"):
+            self.model.generation_config.use_cache = True
         self.tokenizer = AutoTokenizer.from_pretrained(
             models_root_path, trust_remote_code=True
         )
@@ -53,6 +56,7 @@ class HunyuanPromptEnhancer:
         temperature=0,
         top_p=1.0,
         max_new_tokens=512,
+        use_cache=True,
     ):
         """
         Generate a rewritten prompt using the model.
@@ -63,6 +67,7 @@ class HunyuanPromptEnhancer:
             temperature (float): Sampling temperature.
             top_p (float): Top-p sampling parameter.
             max_new_tokens (int): Maximum number of new tokens to generate.
+            use_cache (bool): Whether to enable KV cache during generation.
 
         Returns:
             str: The rewritten prompt, or the original if generation fails.
@@ -88,6 +93,7 @@ class HunyuanPromptEnhancer:
                 do_sample=do_sample,
                 temperature=float(temperature) if do_sample else None,
                 top_p=float(top_p) if do_sample else None,
+                use_cache=bool(use_cache),
             )
 
             # Decode only new tokens and skip special tokens

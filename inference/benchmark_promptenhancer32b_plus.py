@@ -7,6 +7,7 @@ import argparse
 import builtins
 from threading import Thread
 from functools import partial
+from types import MethodType
 from typing import List, Optional
 
 import numpy as np
@@ -151,6 +152,99 @@ def count_non_empty_lines(path: str) -> int:
     return n
 
 
+def get_effective_sequence_length(args, kwargs) -> int:
+    input_ids = kwargs.get("input_ids")
+    if input_ids is None and args and torch.is_tensor(args[0]):
+        input_ids = args[0]
+    if torch.is_tensor(input_ids):
+        return int(input_ids.shape[-1])
+
+    inputs_embeds = kwargs.get("inputs_embeds")
+    if torch.is_tensor(inputs_embeds):
+        return int(inputs_embeds.shape[-2])
+
+    return -1
+
+
+def get_cache_like_keys(kwargs) -> List[str]:
+    cache_like_keys = []
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        if key == "past_key_values" or "cache" in key or key in ("mems", "past_buckets_states"):
+            cache_like_keys.append(key)
+    return sorted(cache_like_keys)
+
+
+def verify_kv_cache_runtime(
+    enhancer,
+    prompt: str,
+    sys_prompt: str,
+    max_new_tokens: int,
+    use_cache: bool,
+):
+    inputs = enhancer.build_inputs(prompt, sys_prompt, device="cuda")
+    probe_kwargs = dict(
+        **inputs,
+        max_new_tokens=max(2, min(4, max_new_tokens)),
+        do_sample=False,
+        use_cache=use_cache,
+    )
+
+    trace = []
+    original_forward = enhancer.model.forward
+
+    def traced_forward(model_self, *args, **kwargs):
+        trace.append(
+            {
+                "seq_len": get_effective_sequence_length(args, kwargs),
+                "cache_keys": get_cache_like_keys(kwargs),
+            }
+        )
+        return original_forward(*args, **kwargs)
+
+    enhancer.model.forward = MethodType(traced_forward, enhancer.model)
+    try:
+        with torch.inference_mode():
+            enhancer.model.generate(**probe_kwargs)
+    finally:
+        enhancer.model.forward = original_forward
+
+    if len(trace) < 2:
+        raise RuntimeError(
+            "KV cache probe collected fewer than 2 forward calls; unable to verify decode behavior."
+        )
+
+    decode_steps = trace[1:]
+    decode_lengths = [step["seq_len"] for step in decode_steps]
+    decode_cache_flags = [bool(step["cache_keys"]) for step in decode_steps]
+
+    print(f"[KV-CACHE] probe_seq_lens={[step['seq_len'] for step in trace]}")
+    print(f"[KV-CACHE] probe_cache_keys={[step['cache_keys'] for step in trace]}")
+
+    if any(length <= 0 for length in decode_lengths):
+        raise RuntimeError(
+            f"KV cache probe saw invalid decode sequence lengths: {decode_lengths}"
+        )
+
+    if use_cache:
+        if any(length != 1 for length in decode_lengths):
+            raise RuntimeError(
+                "KV cache verification failed: decode steps were not single-token after prefill. "
+                f"decode_lengths={decode_lengths}"
+            )
+        if not any(decode_cache_flags):
+            raise RuntimeError(
+                "KV cache verification failed: no cache-like inputs were observed on decode steps."
+            )
+    else:
+        if all(length == 1 for length in decode_lengths) and any(decode_cache_flags):
+            raise RuntimeError(
+                "KV cache verification failed for --no-use-cache: decode still used single-token "
+                "steps with cache-like inputs present."
+            )
+
+
 def get_input_token_length(tokenizer, user_prompt: str, sys_prompt: str) -> int:
     ids = tokenizer(user_prompt, return_tensors="pt")["input_ids"]
     return int(ids.shape[1])
@@ -287,6 +381,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--use-cache", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable KV cache during generation (default: true)")
+    parser.add_argument("--verify-kv-cache", action=argparse.BooleanOptionalAction, default=False,
+                        help="Probe decode-time sequence lengths to verify KV cache behavior")
     parser.add_argument("--save-every", type=int, default=50,
                         help="Incremental flush interval for e2e/output-lens txt (default: 50)")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -435,6 +531,17 @@ def main():
             f"model.config.use_cache={getattr(getattr(enhancer.model, 'config', None), 'use_cache', None)} "
             f"generation_config.use_cache={getattr(getattr(enhancer.model, 'generation_config', None), 'use_cache', None)}"
         )
+
+        if args.verify_kv_cache:
+            print("[KV-CACHE] Running runtime verification probe...")
+            verify_kv_cache_runtime(
+                enhancer,
+                remaining_prompts[0],
+                sys_prompt=args.sys_prompt,
+                max_new_tokens=args.max_new_tokens,
+                use_cache=bool(args.use_cache),
+            )
+            print("[KV-CACHE] Runtime verification passed.")
 
         warmup_n = min(args.warmup, len(remaining_prompts))
         print(f"Warmup x {warmup_n}")
